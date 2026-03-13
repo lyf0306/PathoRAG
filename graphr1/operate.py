@@ -1,5 +1,6 @@
 # operate.py
 import asyncio
+import math
 import json
 import re
 from tqdm.asyncio import tqdm as tqdm_async
@@ -632,9 +633,9 @@ async def _build_query_context(
     text_chunks_db: BaseKVStorage[TextChunkSchema],
     query_param: QueryParam,
 ):
-
     ll_kewwords, hl_keywrds = query[0], query[1]
 
+    # 1. 第一路：知识图谱（逻辑推演召回，黄金标准）
     knowledge_list_1 = await _get_node_data(
         ll_kewwords,
         knowledge_graph_inst,
@@ -643,6 +644,8 @@ async def _build_query_context(
         query_param,
     )
 
+    # 2. 第二路：向量数据库（字面语义召回，作为补充）
+    # (如果你的 Reranker 是在这一路生效的，它的结果已经在这个 list 里排好序了)
     knowledge_list_2 = await _get_edge_data(
         hl_keywrds,
         knowledge_graph_inst,
@@ -651,22 +654,54 @@ async def _build_query_context(
         query_param,
     )
     
+    # 🌟 核心学术创新：加权倒数排序融合 (W-RRF - Weighted Reciprocal Rank Fusion)
     know_score = dict()
+    
+    # RRF 平滑常数 K (信息检索领域标准推荐值为 60，防止 Rank 1 权重畸高失真)
+    K = 60.0 
+    
+    # ⚠️ 特权权重：因为图谱的结果经过了严格的临床排他与赋权，我们赋予它绝对主导权！
+    ALPHA = 2.0  # 图谱逻辑的权重乘数 (可调节)
+    BETA = 1.5   # 向量语义的权重乘数
+    
+    # 计算图谱路 RRF 得分
     for i, k in enumerate(knowledge_list_1):
         if k not in know_score:
-            know_score[k] = 0
-        score = 1/(i+1)
-        know_score[k] += score
+            know_score[k] = 0.0
+        # 公式: Alpha * (1 / (K + Rank))
+        know_score[k] += ALPHA * (1.0 / (K + i + 1))
+        
+    # 计算向量路 RRF 得分
     for i, k in enumerate(knowledge_list_2):
         if k not in know_score:
-            know_score[k] = 0
-        score = 1/(i+1)
-        know_score[k] += score
+            know_score[k] = 0.0
+        # 公式: Beta * (1 / (K + Rank))
+        know_score[k] += BETA * (1.0 / (K + i + 1))
+        
+    # 按照最终的混合 RRF 得分降序排列，并截断至 top_k
     knowledge_list = sorted(know_score.items(), key=lambda x: x[1], reverse=True)[:query_param.top_k]
-    knowledge=[]
+    
+    # ==== 🖨️ 控制台打印融合战报 (让你亲眼看着图谱如何碾压 Reranker) ====
+    print("\n" + "="*15 + " ⚖️ [W-RRF 双路加权融合战报] " + "="*15)
+    for idx, (content, score) in enumerate(knowledge_list):
+        snippet = content[:30].replace('\n', ' ') + "..."
+        source = []
+        if content in knowledge_list_1:
+            source.append(f"图谱(Rank {knowledge_list_1.index(content)+1})")
+        if content in knowledge_list_2:
+            source.append(f"向量(Rank {knowledge_list_2.index(content)+1})")
+            
+        print(f"Top {idx+1} | 融合得分: {score:.5f} | 来源: {' ➕ '.join(source)}")
+        print(f"  └─ 内容: {snippet}")
+    print("="*62 + "\n")
+
+    # 组装最终格式返回
+    knowledge = []
     for k in knowledge_list:
-        knowledge.append({"<knowledge>": k[0], "<coherence>": round(k[1],3)})
+        knowledge.append({"<knowledge>": k[0], "<coherence>": round(k[1], 4)})
+        
     return knowledge
+
 
 
 async def _get_node_data(
@@ -678,26 +713,52 @@ async def _get_node_data(
 ):  
     results = entities_vdb
     if not len(results):
-        return "", "", ""
+        return [] # 修复：返回空列表而非空元组，防止后续迭代报错
+
+    # [FIX]: 如果结果是字典（来自向量库），提取 entity_name；如果是字符串（来自关键词），直接使用
+    node_keys = [r["entity_name"] if isinstance(r, dict) else r for r in results]
+
     # get entity information
     node_datas = await asyncio.gather(
-        *[knowledge_graph_inst.get_node(r) for r in results]
+        *[knowledge_graph_inst.get_node(k) for k in node_keys]
     )
     if not all([n is not None for n in node_datas]):
         logger.warning("Some nodes are missing, maybe the storage is damaged")
 
     # get entity degree
     node_degrees = await asyncio.gather(
-        *[knowledge_graph_inst.node_degree(r) for r in results]
+        *[knowledge_graph_inst.node_degree(k) for k in node_keys]
     )
+    
+    # [FIX]: 使用 node_keys 进行 zip
     node_datas = [
         {**n, "entity_name": k, "rank": d}
-        for k, n, d in zip(results, node_datas, node_degrees)
+        for k, n, d in zip(node_keys, node_datas, node_degrees)
         if n is not None
     ]  
     use_relations = await _find_most_related_edges_from_entities(
         node_datas, query_param, knowledge_graph_inst
     )
+
+    # 🌟【新增调试代码】：在控制台打印超图多维召回的效果
+    print("\n" + "="*20 + " 🚀 [超图多维特征同构召回效果演示] " + "="*20)
+    for idx, edge in enumerate(use_relations[:5]): # 打印排名前5的召回结果
+        matched_ents = edge.get('matched_entities', [])
+        score = edge.get('coverage_score', 0)
+        desc_snippet = edge.get('description', '')[:60].replace('\n', ' ') # 截取前60个字符
+        print(f"Top {idx+1} | 覆盖实体数: {score} | 命中实体: {matched_ents}")
+        print(f"  └─ 方案内容: {desc_snippet}...")
+    print("="*75 + "\n")
+
+    # 🌟【修改上下文组装】：把命中逻辑直接喂给大模型，加强大模型的因果推理
+    knowledge_list = []
+    for s in use_relations:
+        desc = s["description"].replace("<hyperedge>", "")
+        matched = ", ".join(s.get("matched_entities", []))
+        # 结构化绑定：强制大模型知道这个方案是因为什么病理特征才被拉出来的
+        structured_context = f"[触发该方案的患者特征: {matched}] -> 具体临床方案: {desc}"
+        knowledge_list.append(structured_context)
+
     knowledge_list = [s["description"].replace("<hyperedge>","") for s in use_relations]
     return knowledge_list
 
@@ -776,40 +837,183 @@ async def _find_most_related_text_unit_from_entities(
     return all_text_units
 
 
+# 💡 全局配置：定义临床语义角色权重乘数
+ROLE_WEIGHT_MULTIPLIERS = {
+    "CONDITION": 1.5,          # 适应症/前提条件 -> 高奖励
+    "RECOMMENDATION": 1.2,     # 推荐动作 -> 中奖励
+    "CONTRAINDICATION": 3.0,   # 禁忌症 -> 极高权重强行召回，以便触发红色警报！
+    "EVIDENCE": 0.8,           # 循证依据 -> 略微降权
+    "CONTEXT": 0.2,            # 背景/套话 -> 极度重罚
+    "UNKNOWN": 1.0             # 默认/缺失 role 时
+}
+
 async def _find_most_related_edges_from_entities(
     node_datas: list[dict],
     query_param: QueryParam,
     knowledge_graph_inst: BaseGraphStorage,
 ):
+    # ==========================================
+    # 阶段一：获取带有 Role (语义角色) 的一阶边
+    # ==========================================
     all_related_edges = await asyncio.gather(
-        *[knowledge_graph_inst.get_node_edges(dp["entity_name"]) for dp in node_datas]
+        *[knowledge_graph_inst.get_node_edges_with_roles(dp["entity_name"]) for dp in node_datas]
     )
-    all_edges = []
-    seen = set()
 
-    for this_edges in all_related_edges:
+    hyperedge_to_entities = defaultdict(list)
+    entity_to_hyperedges = defaultdict(list) 
+    
+    for dp, this_edges in zip(node_datas, all_related_edges):
+        if not this_edges:
+            continue
+        entity_name = dp["entity_name"]
         for e in this_edges:
-            sorted_edge = tuple(e)
-            if sorted_edge not in seen:
-                seen.add(sorted_edge)
-                all_edges.append(sorted_edge)
+            he_name = e[1]
+            role = e[2] if len(e) > 2 else "UNKNOWN"
+            hyperedge_to_entities[he_name].append((entity_name, role))
+            entity_to_hyperedges[entity_name].append(he_name)
 
-    all_edges_pack = await asyncio.gather(
-        *[knowledge_graph_inst.get_edge(e[0], e[1]) for e in all_edges]
+    unique_hyperedges = list(hyperedge_to_entities.keys())
+
+    # ==========================================
+    # 阶段二：获取二阶邻居，计算超边密度与 Parent 归属
+    # ==========================================
+    hyperedge_neighbors = await asyncio.gather(
+        *[knowledge_graph_inst.get_node_edges(he) for he in unique_hyperedges]
     )
-    all_edges_degree = await asyncio.gather(
-        *[knowledge_graph_inst.edge_degree(e[0], e[1]) for e in all_edges]
+
+    hyperedge_density = {}
+    parent_aggregation = defaultdict(lambda: {"contained_hyperedges": set(), "matched_items": set()})
+    
+    for he, neighbors in zip(unique_hyperedges, hyperedge_neighbors):
+        if not neighbors:
+            hyperedge_density[he] = 1
+            continue
+            
+        hyperedge_density[he] = len(neighbors) 
+        
+        for edge in neighbors:
+            neighbor_name = edge[1]
+            if neighbor_name.startswith("paper::"): 
+                parent_aggregation[neighbor_name]["contained_hyperedges"].add(he)
+                parent_aggregation[neighbor_name]["matched_items"].update(hyperedge_to_entities[he])
+
+    # ==========================================
+    # 阶段三：计算二阶拓扑实体基础权重 (Specificity × Density)
+    # ==========================================
+    entity_base_weights = {}
+    entity_degrees = {dp["entity_name"]: dp.get("rank", 1) if dp.get("rank", 1) > 0 else 1 for dp in node_datas}
+    
+    for ent, d1 in entity_degrees.items():
+        specificity = 1.0 / math.log10(d1 + 10)
+        connected_hes = entity_to_hyperedges.get(ent, [])
+        if connected_hes:
+            avg_density = sum([math.log10(hyperedge_density.get(he, 1) + 2) for he in connected_hes]) / len(connected_hes)
+        else:
+            avg_density = 0.1 
+        entity_base_weights[ent] = specificity * avg_density
+
+    max_w = max(entity_base_weights.values()) if entity_base_weights else 1.0
+    for k in entity_base_weights:
+        entity_base_weights[k] = round(entity_base_weights[k] / max_w, 3)
+
+    # ==========================================
+    # 阶段四：融合 Role 乘数，计算 Parent 级综合得分
+    # ==========================================
+    parent_scores = []
+    for parent, data in parent_aggregation.items():
+        matched_items = list(data["matched_items"]) 
+        weighted_coverage = 0
+        contraindication_alerts = [] 
+
+        for ent, role in matched_items:
+            base_w = entity_base_weights.get(ent, 0.5)
+            role_multiplier = ROLE_WEIGHT_MULTIPLIERS.get(role, 1.0)
+            final_score = base_w * role_multiplier
+            weighted_coverage += final_score
+
+            if role == "CONTRAINDICATION":
+                contraindication_alerts.append(ent)
+
+        if weighted_coverage > 0:
+            parent_scores.append({
+                "parent_name": parent,
+                "coverage_score": round(weighted_coverage, 3),
+                "contained_hyperedges": list(data["contained_hyperedges"]),
+                "matched_items": matched_items,
+                "contraindication_alerts": list(set(contraindication_alerts)) 
+            })
+
+    parent_scores = sorted(
+        parent_scores,
+        key=lambda x: (x["coverage_score"], len(x["contained_hyperedges"])),
+        reverse=True
     )
-    all_edges_data = [
-        {"src_tgt": k, "rank": d, "description": k[1], **v}
-        for k, v, d in zip(all_edges, all_edges_pack, all_edges_degree)
-        if v is not None
-    ]
-    all_edges_data = sorted(
-        all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True
-    )
+
+    top_parents = parent_scores[:5] 
+
+    # ==========================================
+    # 🌟 阶段 4.5：在控制台打印可解释的“计算推演树”
+    # ==========================================
+    print("\n" + "="*15 + " 🧮 [临床语义加权计算过程明细] " + "="*15)
+    for i, p in enumerate(top_parents):
+        print(f"[{i+1}] 归属文献: {p['parent_name']}")
+        print(f"    ⭐ 文献总加权分 (所有独立实体得分相加): {p['coverage_score']}")
+        
+        # 为了展示详细计算，我们重新过一遍超边
+        for he in p["contained_hyperedges"]:
+            hit_items = hyperedge_to_entities[he]
+            he_score = 0
+            detail_strs = []
+            
+            for ent, role in hit_items:
+                base_w = entity_base_weights.get(ent, 0.5)
+                role_m = ROLE_WEIGHT_MULTIPLIERS.get(role, 1.0)
+                sub_score = base_w * role_m
+                he_score += sub_score
+                # 记录公式明细
+                detail_strs.append(f"{ent}(Base:{base_w:.2f} × {role}:{role_m})={sub_score:.2f}")
+                
+            # 截取超边内容前25个字符显示，保持控制台整洁
+            he_snippet = he[:25].replace('\n', '') + "..." 
+            print(f"    ├─ 命中动作: {he_snippet} | 动作得分: {he_score:.2f}")
+            print(f"    │   └─ 公式: {' + '.join(detail_strs)}")
+    print("="*60 + "\n")
+
+    # ==========================================
+    # 阶段五：组装高度结构化且带防守预警的上下文
+    # ==========================================
+    all_edges_data = []
+
+    for p in top_parents:
+        aggregated_desc = f"【权威循证溯源：{p['parent_name']}】(匹配度得分: {p['coverage_score']})\n"
+        
+        if p["contraindication_alerts"]:
+            alerts_str = ", ".join(p["contraindication_alerts"])
+            aggregated_desc += f"  [⚠️ 临床绝对警报]：该患者具有特征 {alerts_str}，命中了本方案的【禁忌症(CONTRAINDICATION)】，请谨慎评估或否决本指南的常规方案！\n"
+
+        intra_group_edges = []
+        for he in p["contained_hyperedges"]:
+            hit_items = hyperedge_to_entities[he] 
+            he_weight = sum([entity_base_weights.get(ent, 0.5) * ROLE_WEIGHT_MULTIPLIERS.get(role, 1.0) for ent, role in hit_items])
+            intra_group_edges.append((he, he_weight, hit_items))
+            
+        intra_group_edges.sort(key=lambda x: x[1], reverse=True)
+        kept_edges = intra_group_edges[:4] 
+        
+        for idx, (he, w, hit_items) in enumerate(kept_edges):
+            # 将得分公式精简版传给 LLM 增加其可信赖度
+            trigger_reason = ", ".join([f"{ent}({role},得分:{round(entity_base_weights.get(ent, 0.5)*ROLE_WEIGHT_MULTIPLIERS.get(role, 1.0), 2)})" for ent, role in hit_items])
+            aggregated_desc += f"  > 核心干预动作 {idx+1} [触发逻辑: {trigger_reason}]: {he}\n"
+
+        all_edges_data.append({
+            "description": aggregated_desc,
+            "coverage_score": p["coverage_score"],
+            "rank": len(p["contained_hyperedges"]),
+            "matched_entities": [item[0] for item in p["matched_items"]], 
+            "weight": 1.0
+        })
+
     return all_edges_data
-
 
 async def _get_edge_data(
     keywords,
@@ -821,18 +1025,22 @@ async def _get_edge_data(
     results = hyperedges_vdb
 
     if not len(results):
-        return "", "", ""
+        return [] # 修复返回值
+
+    # [FIX]: 提取 hyperedge_name
+    edge_keys = [r["hyperedge_name"] if isinstance(r, dict) else r for r in results]
 
     edge_datas = await asyncio.gather(
-        *[knowledge_graph_inst.get_node(r) for r in results]
+        *[knowledge_graph_inst.get_node(k) for k in edge_keys]
     )
 
     if not all([n is not None for n in edge_datas]):
         logger.warning("Some edges are missing, maybe the storage is damaged")
 
+    # [FIX]: 使用 edge_keys 进行 zip
     edge_datas = [
         {"hyperedge": k, "rank": v["weight"], **v}
-        for k, v in zip(results, edge_datas)
+        for k, v in zip(edge_keys, edge_datas)
         if v is not None
     ]
     edge_datas = sorted(
