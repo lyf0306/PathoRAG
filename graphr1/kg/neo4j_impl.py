@@ -160,6 +160,19 @@ class Neo4JStorage(BaseGraphStorage):
                 return data
             return None
 
+    # 请在你的 Neo4j 实现类中加入这个方法
+    async def get_node_edges_with_roles(self, source_node_name: str):
+        if not await self.has_node(source_node_name):
+            return []
+        async with self.driver.session(database=self.database) as session:
+            # 根据你的实际建图属性，确保获取到 r.role
+            query = "MATCH (n {name: $name})-[r]-(m) RETURN m.name as target, r.role as role"
+            result = await session.run(query, name=source_node_name)
+            edges = []
+            async for record in result:
+                edges.append((source_node_name, record["target"], record.get("role", "UNKNOWN")))
+            return edges
+
     async def get_edge(self, src_node_name: str, tgt_node_name: str):
         async with self.driver.session(database=self.database) as session:
             query = "MATCH (a {name: $src_name})-[r]->(b {name: $tgt_name}) RETURN r"
