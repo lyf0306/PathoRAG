@@ -42,9 +42,9 @@ class ClinicalScoringNetwork(nn.Module):
         super(ClinicalScoringNetwork, self).__init__()
         self.fc1 = nn.Linear(embedding_dim * 4, hidden_dim)
         self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, 128) # 确保这里是 128
+        self.fc2 = nn.Linear(hidden_dim, 128) 
         self.dropout = nn.Dropout(0.5)
-        self.out = nn.Linear(128, 1)          # 确保这里是 128 -> 1
+        self.out = nn.Linear(128, 1)          
 
     def forward(self, anchor_emb, candidate_emb):
         diff = torch.abs(anchor_emb - candidate_emb)
@@ -59,8 +59,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ================= 指南权威层级判定 =================
 def get_guideline_tier(guideline_str):
-    if not guideline_str:
-         return 4
+    if not guideline_str: return 4
     g_str = str(guideline_str).upper()
     if "ESGO" in g_str: return 1
     elif "FIGO" in g_str: return 2
@@ -68,10 +67,8 @@ def get_guideline_tier(guideline_str):
     else: return 4
 
 TIER_NAMES = {
-    1: "ESGO指南 (首选)", 
-    2: "FIGO推荐 (次选)", 
-    3: "NCCN指南 (推荐)", 
-    4: "其他指南参考"
+    1: "ESGO指南 (首选)", 2: "FIGO推荐 (次选)", 
+    3: "NCCN指南 (推荐)", 4: "其他指南参考"
 }
 
 # ================= 获取图谱文献来源 =================
@@ -79,10 +76,10 @@ async def get_source_details(graph_engine, knowledge_text):
     sources_info = []
     try:
         storage = graph_engine.chunk_entity_relation_graph
-        if not hasattr(storage, 'driver'):
-            return sources_info
+        if not hasattr(storage, 'driver'): return sources_info
             
         async with storage.driver.session() as session:
+            # 兼容宏观聚合片段与单条语义片段
             if knowledge_text.startswith("【权威循证溯源："):
                 match = re.search(r'【权威循证溯源：(.*?)】', knowledge_text)
                 if match:
@@ -94,8 +91,7 @@ async def get_source_details(graph_engine, knowledge_text):
                     """
                     result = await session.run(cypher_query, paper_name=paper_name)
                     records = await result.data()
-                else:
-                    records = []
+                else: records = []
             else:
                 node_id = f"<hyperedge>{knowledge_text}"
                 cypher_query = """
@@ -154,7 +150,7 @@ async def extract_bilingual_features(patient_case, client):
         print(f"[Warning] 提取双语检索词失败: {e}")
         return patient_case
 
-# ================= Qwen-Reranker 打分逻辑 =================
+# ================= Qwen-Reranker 打分逻辑 (向量流拦截器) =================
 async def compute_rerank_score(query, doc, client):
     instruction = "Given a clinical case, retrieve relevant clinical guidelines and evidence that help formulate a treatment plan."
     prompt = f"<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n<Instruct>: {instruction}\n\n<Query>: {query}\n\n<Document>: {doc}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -248,32 +244,24 @@ async def main():
             for item in retrieved_results:
                 if isinstance(item, dict):
                     content = item.get('<knowledge>', str(item)).strip()
-                    if content in ["RELATES_TO", "BELONG_TO", "EVIDENCE", ""] or len(content) < 5: continue
+                    # 🚀 修复1：完美接住底层传上来的图谱信息熵推演分数
+                    graph_score = float(item.get('<coherence>', 0.0))
+                    
+                    if content in ["RELATES_TO", "BELONG_TO", "EVIDENCE", ""] or len(content) < 5: 
+                        continue
                         
-                    storage = graph_engine.chunk_entity_relation_graph
+                    # 🚀 修复2：尊重底层的宏观聚合，废弃业务层的多余图谱多跳检索
                     if content.startswith("【权威循证溯源："):
-                        extended_knowledge_pool[content] = {"type": "图谱推演"}
+                        if "⚠️ 临床绝对警报" in content:
+                            tag_info = "🚨 禁忌症熔断警报 (图谱绝对防守)"
+                        else:
+                            tag_info = "🧠 图谱高阶逻辑推演"
+                        extended_knowledge_pool[content] = {"type": tag_info, "graph_score": graph_score}
                     else:
-                        node_id = f"<hyperedge>{content}"
-                        if hasattr(storage, 'driver'):
-                            async with storage.driver.session() as session:
-                                check_query = "MATCH (e)-[r:RELATES_TO]->(h) WHERE h.name = $node_id RETURN DISTINCT r.role AS role"
-                                check_res = await session.run(check_query, node_id=node_id)
-                                roles = [rec["role"] for rec in await check_res.data() if rec["role"]]
-                                extended_knowledge_pool[content] = {"type": f"关联命中 ({','.join(roles) if roles else '未知'})"}
-                                
-                                expand_query = """MATCH (start_h)<-[:RELATES_TO]-(e)-[r2:RELATES_TO]->(target_h)
-                                WHERE start_h.name = $node_id AND target_h.name STARTS WITH '<hyperedge>' AND start_h <> target_h AND r2.role IN ['RECOMMENDATION', 'CONTRAINDICATION']
-                                RETURN DISTINCT target_h.name AS neighbor_id, r2.role AS target_role LIMIT 3"""
-                                expand_res = await session.run(expand_query, node_id=node_id)
-                                for rec in await expand_res.data():
-                                    neighbor_content = rec["neighbor_id"].replace("<hyperedge>", "")
-                                    if neighbor_content not in extended_knowledge_pool:
-                                        extended_knowledge_pool[neighbor_content] = {"type": f"多跳补充 ({rec['target_role']})"}
-                        else: extended_knowledge_pool[content] = {"type": "非Neo4j命中"}
+                        extended_knowledge_pool[content] = {"type": "🧩 纯向量语义召回", "graph_score": graph_score}
 
             # ==========================================
-            # 🚀 深度医学逻辑融合法 (Neural Reranking) + 熔断保送
+            # 🚀 深度医学逻辑融合法 (Graph Entropy + Neural Scoring)
             # ==========================================
             fragments_to_sort = []
             anchor_emb_np = await embedding_func(enhanced_query)
@@ -285,6 +273,7 @@ async def main():
                 candidates_tensor = torch.tensor(candidates_emb_np, dtype=torch.float32).to(DEVICE)
                 anchor_tensor_expanded = anchor_tensor.expand(len(candidate_contents), -1)
                 
+                # 获取神经网络的纯语义打分
                 with torch.no_grad():
                     neural_scores = scorer_model(anchor_tensor_expanded, candidates_tensor).cpu().numpy()
                 
@@ -292,32 +281,44 @@ async def main():
                     info = extended_knowledge_pool[content]
                     sources = await get_source_details(graph_engine, content)
                     best_tier = min([get_guideline_tier(src.get('guidelines', '')) for src in sources] + [4])
-                    raw_neural_score = float(neural_scores[idx])
                     
-                    # 🚀 【核心修复】：硬逻辑熔断与保送通道 (Hard-Logic Bypass)
-                    if "⚠️ 临床绝对警报" in content or "禁忌症" in content:
-                        raw_neural_score = 1.5  
-                        info["type"] = "🚨 禁忌症熔断警报 (绝对保送)"
-                        best_tier = 1 
-                    elif "图谱推演" in info.get("type", ""):
-                        raw_neural_score = max(raw_neural_score, 0.9)
-                        info["type"] = "🧠 图谱高阶逻辑 (规则兜底)"
+                    raw_neural_score = float(neural_scores[idx])
+                    graph_score = info["graph_score"]
+                    
+                    # ==========================================
+                    # 🌟 核心算法：图谱拓扑与神经网络的加权融合
+                    # ==========================================
+                    if "🚨" in info["type"]:
+                        # 触发禁忌症的文献，底层已经给 graph_score 加了极大分数
+                        # 直接霸体保送，绝不让神经网络的低分把它刷掉！
+                        final_score = graph_score + 1000.0  
+                    elif "🧠" in info["type"]:
+                        # 图谱逻辑推演出来的宏观方案：
+                        # 用图谱分主导，神经网络分做微调
+                        final_score = (graph_score * 0.7) + (raw_neural_score * 0.3)
+                    else:
+                        # 零散的纯向量召回片段：
+                        # 此时完全相信双塔深度神经网络打分
+                        final_score = raw_neural_score
                         
-                    tier_bonus = (4 - best_tier) * 0.3 
-                    final_score = raw_neural_score + tier_bonus
+                    # 加上权威指南的微小加成
+                    tier_bonus = (4 - best_tier) * 0.1 
+                    final_score += tier_bonus
                     
                     fragments_to_sort.append({
                         "content": content, "info": info, "sources": sources,
-                        "best_tier": best_tier, "neural_score": raw_neural_score, "final_score": final_score
+                        "best_tier": best_tier, "neural_score": raw_neural_score, 
+                        "graph_score": graph_score, "final_score": final_score
                     })
             
+            # 按最终融合得分降序排列
             fragments_to_sort.sort(key=lambda x: x["final_score"], reverse=True)
             
             # 💡 精简输出：将最终喂给大模型的文献严格限制在 Top 10
             TOP_N_FOR_LLM = 10
             selected_fragments = fragments_to_sort[:TOP_N_FOR_LLM]
 
-            print("\n" + "="*20 + f" 神经网络重排顶级证据 (Top {len(selected_fragments)}) " + "="*20)
+            print("\n" + "="*20 + f" Graph+Neural 融合重排顶级证据 (Top {len(selected_fragments)}) " + "="*20)
             bibliography, ref_counter, llm_context_list = {}, 1, []
             
             for idx, frag in enumerate(selected_fragments):
@@ -333,7 +334,8 @@ async def main():
                 tier_name = TIER_NAMES[frag['best_tier']]
                 ref_tag = f"【来源文献: {', '.join(source_indices)} | 证据级别: {tier_name}】" if source_indices else "【来源文献: 未知 | 证据级别: 缺乏指南支撑】"
                 
-                print(f"[{idx+1}] [{frag['info']['type']}] 复合终分: {frag['final_score']:.3f} (网络裸分:{frag['neural_score']:.3f} | {tier_name})")
+                # 打印日志展示融合评分详情
+                print(f"[{idx+1}] [{frag['info']['type']}] 复合终分: {frag['final_score']:.3f} (图谱推演分:{frag['graph_score']:.3f} | MLP预测分:{frag['neural_score']:.3f} | {tier_name})")
                 print(f"内容: {frag['content'][:100]}...") 
                 print("-" * 30)
                 llm_context_list.append(f"{ref_tag} {frag['content']}")
@@ -350,11 +352,11 @@ async def main():
         "你是一个权威的妇科肿瘤临床辅助决策系统。\n"
         "请根据【参考证据】制定详细、可落地的术后辅助治疗方案。\n"
         "要求：\n"
-        "1. 使用 <think>...</think> 进行循证推理分析。对于明确标注为【绝对保送/禁忌症】的证据，具有最高临床否决权，务必优先采纳。\n"
+        "1. 使用 <think>...</think> 进行循证推理分析。对于明确标注为【临床绝对警报/禁忌症】的证据，具有最高临床否决权，务必优先采纳并规避相关方案。\n"
         "2. 输出 <answer>...</answer> 结论。\n"
         "3. 方案必须极其详尽，必须明确随访频率、检查项目及内分泌/放化疗的周期和标准。\n"
         "4. 在建议中引用证据时，请直接使用原文中提供的序号标签，例如 '根据 [1] 的指南建议...'\n"
-        "5. 【关键准则】：参考证据已根据医学逻辑模型打分排序，排名越靠前的方案优先级越高。"
+        "5. 【关键准则】：参考证据已根据底层信息熵打分排序，排名越靠前的方案优先级越高。"
     )
     user_prompt = f"【患者信息】\n{patient_case}\n\n【参考证据】\n{context_str}\n\n请制定极其详细的术后辅助治疗方案。"
 
