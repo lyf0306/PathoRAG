@@ -673,9 +673,9 @@ async def _get_node_data(
 ):  
     results = entities_vdb
     if not len(results):
-        return [] # 修复：返回空列表而非空元组，防止后续迭代报错
+        return {} # ⚠️ 修复：返回空字典，防止后续迭代报错
 
-    # [FIX]: 如果结果是字典（来自向量库），提取 entity_name；如果是字符串（来自关键词），直接使用
+    # 如果结果是字典（来自向量库），提取 entity_name；如果是字符串（来自关键词），直接使用
     node_keys = [r["entity_name"] if isinstance(r, dict) else r for r in results]
 
     # get entity information
@@ -690,7 +690,7 @@ async def _get_node_data(
         *[knowledge_graph_inst.node_degree(k) for k in node_keys]
     )
     
-    # [FIX]: 使用 node_keys 进行 zip
+    # 使用 node_keys 进行 zip
     node_datas = [
         {**n, "entity_name": k, "rank": d}
         for k, n, d in zip(node_keys, node_datas, node_degrees)
@@ -710,17 +710,17 @@ async def _get_node_data(
         print(f"  └─ 方案内容: {desc_snippet}...")
     print("="*75 + "\n")
 
-    # 🌟【修改上下文组装】：把命中逻辑直接喂给大模型，加强大模型的因果推理
-    knowledge_list = []
+    # 🌟【纯净解耦】：返回字典 {结构化上下文文本: 纯图谱信息熵饱和度}
+    knowledge_dict = {}
     for s in use_relations:
+        # 底层 _find_most_related... 已经精心组装好了带【权威循证溯源】和命中特征的绝美文本
+        # 我们不需要再套任何外壳，直接原汁原味透传，以免破坏 test.py 的解析逻辑！
         desc = s["description"].replace("<hyperedge>", "")
-        matched = ", ".join(s.get("matched_entities", []))
-        # 结构化绑定：强制大模型知道这个方案是因为什么病理特征才被拉出来的
-        structured_context = f"[触发该方案的患者特征: {matched}] -> 具体临床方案: {desc}"
-        knowledge_list.append(structured_context)
+        
+        # 提取图谱底层推演出来的原始分数 (coverage_score)
+        knowledge_dict[desc] = s.get("coverage_score", 0.0)
 
-    knowledge_list = [s["description"].replace("<hyperedge>","") for s in use_relations]
-    return knowledge_list
+    return knowledge_dict
 
 
 async def _find_most_related_text_unit_from_entities(
