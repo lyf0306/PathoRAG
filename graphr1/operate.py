@@ -630,37 +630,56 @@ async def _build_query_context(
     hyperedges_vdb: BaseVectorStorage,
     text_chunks_db: BaseKVStorage[TextChunkSchema],
     query_param: QueryParam,
-    global_config: dict, # <--- 接收配置
+    global_config: dict, 
 ):
     ll_kewwords, hl_keywrds = query[0], query[1]
 
-    # 【流 A】图谱流：拓扑计分 (内部已排序) -> 获得 Rank A
-    knowledge_list_1 = await _get_node_data(
+    # 【流 A】图谱多跳流：返回 {内容: 原始图谱推演饱和度}
+    graph_dict = await _get_node_data(
         ll_kewwords, knowledge_graph_inst, entities_vdb, text_chunks_db, query_param
     )
 
-    # 【流 B】向量流：传入查询词和配置，内部触发 Rerank 洗牌 -> 获得 Rank B
-    knowledge_list_2 = await _get_edge_data(
+    # 【流 B】向量单跳流：返回 [内容列表]
+    vector_list = await _get_edge_data(
         hl_keywrds, knowledge_graph_inst, hyperedges_vdb, text_chunks_db, query_param, global_config
     )
     
-    # 【终极组装】W-RRF 双路融合
-    know_score = dict()
-    K = 60.0 
-    ALPHA = 1.5  # 图谱特权权重 (保护临床绝对禁忌和强关联)
-    BETA = 1.0   # 向量语义权重
-
-    for i, k in enumerate(knowledge_list_1):
-        if k not in know_score: know_score[k] = 0.0
-        know_score[k] += ALPHA * (1.0 / (K + i + 1))
-        
-    for i, k in enumerate(knowledge_list_2):
-        if k not in know_score: know_score[k] = 0.0
-        know_score[k] += BETA * (1.0 / (K + i + 1))
-        
-    knowledge_list = sorted(know_score.items(), key=lambda x: x[1], reverse=True)[:query_param.top_k]
+    # ========================================================
+    # 🌟 彻底剔除 W-RRF！使用纯净的优先级与自然量纲机制
+    # ========================================================
+    final_candidates = {}
     
-    knowledge = [{"<knowledge>": k[0], "<coherence>": round(k[1], 4)} for k in knowledge_list]
+    # 1. 处理图谱多跳方案
+    if graph_dict:
+        for content, raw_score in graph_dict.items():
+            if raw_score > 500:
+                # 🚨 绝对禁忌症：保送入围，但图谱逻辑特权分给 0.0
+                priority = raw_score 
+                graph_logic_score = 0.0
+            else:
+                # 正常多跳方案：不搞任何恶心的公式压缩，直接封顶 1.0！
+                graph_logic_score = min(float(raw_score), 1.0)
+                # 赋予海选霸体特权 (+1.0)，碾压普通向量
+                priority = graph_logic_score + 1.0 
+                
+            final_candidates[content] = {"priority": priority, "coherence": graph_logic_score}
+
+    # 2. 处理向量单跳方案
+    for i, content in enumerate(vector_list):
+        if content not in final_candidates:
+            # 纯单跳方案：海选优先级平滑衰减
+            decay_priority = 0.85 * (0.95 ** i)
+            # 缺乏图谱背书，图谱底薪只给 0.1！
+            final_candidates[content] = {"priority": decay_priority, "coherence": 0.1}
+        else:
+            # 双路共识方案：加分奖励
+            final_candidates[content]["priority"] += 0.5
+            
+    # 3. 严格按海选优先级截断 Top 40
+    sorted_candidates = sorted(final_candidates.items(), key=lambda x: x[1]["priority"], reverse=True)[:query_param.top_k]
+    
+    # 将极其纯净的自然得分透传给 MoE
+    knowledge = [{"<knowledge>": k, "<coherence>": round(v["coherence"], 4)} for k, v in sorted_candidates]
     return knowledge
 
 
