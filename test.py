@@ -39,7 +39,7 @@ os.environ["NEO4J_PASSWORD"] = "12345678"
 os.environ["NEO4J_DATABASE"] = "neo4j"
 
 init_attention_system(
-    model_path="/root/Model/clinical_attention_v1.pth",
+    model_path="/root/Model/clinical_attention_v2.pth",
     vdb_path="/root/Graph-R1/expr/DeepSeek_QwenEmbed_Graph/vdb_entities.json",
     embedding_dim=2560  # 如果你的 Qwen 是 3584 维，请改成 3584
 )
