@@ -165,8 +165,8 @@ class Neo4JStorage(BaseGraphStorage):
         if not await self.has_node(source_node_name):
             return []
         async with self.driver.session(database=self.database) as session:
-            # 根据你的实际建图属性，确保获取到 r.role
-            query = "MATCH (n {name: $name})-[r]-(m) RETURN m.name as target, r.role as role"
+            # 【关键修改】：加上 ORDER BY 强制按名称排序，保证每次查出来的边顺序绝对一致
+            query = "MATCH (n {name: $name})-[r]-(m) RETURN m.name as target, r.role as role ORDER BY m.name ASC"
             result = await session.run(query, name=source_node_name)
             edges = []
             async for record in result:
@@ -229,12 +229,11 @@ class Neo4JStorage(BaseGraphStorage):
             return record["degree"] if record else 0
 
     async def get_node_edges(self, source_node_name: str):
-        """获取与指定节点相连的所有边，返回 (source, target) 元组列表"""
         if not await self.has_node(source_node_name):
             return None
-
         async with self.driver.session(database=self.database) as session:
-            query = "MATCH (n {name: $name})-[r]-(m) RETURN m.name as target"
+            # 【关键修改】：同样加上 ORDER BY
+            query = "MATCH (n {name: $name})-[r]-(m) RETURN m.name as target ORDER BY m.name ASC"
             result = await session.run(query, name=source_node_name)
             edges = []
             async for record in result:
