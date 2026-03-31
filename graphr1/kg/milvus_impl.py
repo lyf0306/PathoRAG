@@ -22,6 +22,8 @@ class MilvusVectorDBStorge(BaseVectorStorage):
         )
 
     def __post_init__(self):
+        self.meta_fields = {"content", "entity_name", "hyperedge_name", "weight"}
+        
         self._client = MilvusClient(
             uri=os.environ.get(
                 "MILVUS_URI",
