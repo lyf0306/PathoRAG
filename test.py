@@ -147,15 +147,17 @@ async def extract_patient_profile(patient_case, client):
         "  - 淋巴结状态：[填入转移情况及比例，如 0/2未转移]\n"
         "  - 分子分型关键指标：[重点提取 MMR(完整/缺失)、p53(野生/突变)、ER/PR、Ki-67 等]\n\n"
         "【极其重要】：在画像之后，你必须使用 <keywords> 标签提取出中英双语检索词。\n"
-        "🚨【检索词防偏航红线】：检索词【只允许】包含核心肿瘤特征（分期、病理类型、LVSI、淋巴结、分子分型）。【绝对禁止】在检索词中加入高血压、糖尿病、冠心病等非肿瘤合并症，这会导致底层向量检索严重偏航，错失指南！\n"
+        "🚨【检索词提取红线】：\n"
+        "1. 检索词【只允许】包含核心肿瘤特征（分期、病理类型、LVSI、淋巴结、分子分型）。【绝对禁止】在检索词中加入高血压、脑梗等非肿瘤合并症！\n"
+        "2. 【英文检索词必须缩写化】：为了完美匹配国际指南图谱，英文必须使用最精炼的专业缩写与核心词簇。\n"
         "格式必须为：\n"
         "<keywords>\n"
-        "[中文检索词]: 浆液性癌, 低分化, 浸润深肌层, 累及宫颈间质, p53突变型, MMR正常, FIGO IIIA1期\n"
-        "[英文检索词]: Serous carcinoma, Poorly differentiated, Deep myometrial invasion, Cervical stromal involvement, p53 mutated/abn, MMR proficient/pMMR, FIGO IIIA1 stage\n"
+        "[中文检索词]: 子宫内膜样癌, G2, 浸润深肌层, 脉管癌栓阳性, 淋巴结转移, MMR正常, FIGO IIIC1期\n"
+        "[英文检索词]: Endometrioid, G2, deep myometrial invasion, >50% invasion, LVSI, LVSI+, node-positive, pMMR, Stage IIIC1, IIIC\n"
         "</keywords>"
     )
     
-    user_prompt = f"【原始病历源数据】\n{patient_case}\n\n请提取患者画像并生成中英双语 <keywords>。"
+    user_prompt = f"【原始病历源数据】\n{patient_case}\n\n请提取患者画像并生成中英双语的精炼 <keywords>。"
 
     try:
         response = await client.chat.completions.create(
@@ -177,12 +179,95 @@ async def extract_patient_profile(patient_case, client):
             
         print(f"  -> 成功提取全息患者画像与检索词:\n{profile_text}\n\n[检索词]:\n{bilingual_keywords}")
         
-        # 🚨 增加 NCCN 和 ESGO 的“强力路标锚点”，确保底层图谱和向量库强制召回核心指南
-        final_query = f"NCCN ESGO 指南、术后辅助治疗方案与预后生存率 (NCCN ESGO Adjuvant treatment guidelines, prognosis survival rate, recommendations and management)\n{bilingual_keywords}"
-        return profile_text, final_query
+        return profile_text, bilingual_keywords
     except Exception as e:
         print(f"[Warning] 提取特征失败: {e}")
         return patient_case, patient_case
+
+# ================= 🚀 ESGO 风险前置推理 (含自纠错机制) =================
+async def evaluate_esgo_risk(patient_profile, client):
+    sys_prompt = "你是一个严谨的妇科肿瘤专家。你必须严格、字对字地遵循用户提供的逻辑树进行推导，绝对不可使用你的固有记忆或跳过任何步骤。"
+
+    user_prompt = f"""请根据以下提取出的【全息患者画像】，严格按照下方的《ESGO 2025风险判定规则库》进行分级评估。
+
+【全息患者画像】：
+{patient_profile}
+
+【核心医学术语定义（推演必读！）】：
+1. 组织学分级中，G1 和 G2 属于“低级别”（Low grade）；G3 属于“高级别”（High grade）。
+2. 如果 MMR完整/正常，且 P53 为野生型，且未提及 POLE 突变，则该患者属于 NSMP 型（无特定分子谱型）。
+
+【风险判定规则库】（必须一步步对照）：
+规则一：如果分子分型为 POLE 突变型
+- 低危 (Low Risk)：FIGO分期为 IA期、IB期、IC期、或 II期。
+- 不确定风险 (Uncertain Risk)：FIGO分期为 III期或 IVA期。
+
+规则二：如果分子分型为 MMRd 型
+- 低危 (Low Risk)：FIGO分期为 IA期或 IC期。
+- 中危 (Intermediate Risk)：FIGO分期为 IB期；或 IIC期（条件：有肌层浸润，但无宫颈间质浸润且无明显LVSI）。
+- 中高危 (High-Intermediate Risk)：FIGO分期为 IIA期、IIB期；或 IIC期（伴宫颈浸润或明显LVSI）。
+- 高危 (High Risk)：FIGO分期为 III期或 IVA期。
+
+规则三：如果分子分型为 NSMP 型
+子规则 3A：如果是 NSMP 低级别(G1/G2) 且 ER阳性
+- 低危 (Low Risk)：FIGO分期为 IA期。
+- 中危 (Intermediate Risk)：FIGO分期为 IB期或 IIA期。
+- 中高危 (High-Intermediate Risk)：FIGO分期为 IIB期。
+- 高危 (High Risk)：FIGO分期为 III期或 IVA期。
+子规则 3B：如果是 NSMP 高级别(G3) 或 ER阴性（或两者兼有）
+- 不确定风险 (Uncertain Risk)：FIGO分期为 IA1期或 IC期。
+- 高危 (High Risk)：FIGO分期为 IA2期、IA3期、IB期、II期、III期或 IVA期。
+
+规则四：如果分子分型为 p53abn 型
+- 不确定风险 (Uncertain Risk)：FIGO分期为 IA1期或 IC期。
+- 高危 (High Risk)：FIGO分期为 IA2期、IA3期、IB期、II期、III期或 IVA期。
+
+【强制输出格式】：
+思考结束后，你必须在正文中严格输出以下结构，且【最终结论】必须被包含在 `<result>` 标签内！
+输入特征确认：...
+逻辑推理过程：...
+最终结论：<result>高危</result> （仅限填入：低危 / 中危 / 中高危 / 高危 / 不确定风险）"""
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            current_temp = 0.0 if attempt == 0 else 0.3
+            
+            response = await client.chat.completions.create(
+                model=LLM_MODEL_NAME, 
+                messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
+                temperature=current_temp, max_tokens=2048  
+            )
+            raw_content = response.choices[0].message.content.strip()
+            clean_eval_content = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL).strip()
+            
+            risk_level_match = re.search(r'<result>(.*?)</result>', clean_eval_content)
+            extracted_risk_keyword = risk_level_match.group(1).strip() if risk_level_match else ""
+
+            if extracted_risk_keyword and extracted_risk_keyword in ["低危", "中危", "中高危", "高危", "不确定风险", "低风险", "中风险", "高风险"]:
+                risk_mapping = {
+                    "低危": "Low Risk", "低风险": "Low Risk",
+                    "中危": "Intermediate Risk", "中等风险": "Intermediate Risk",
+                    "中高危": "High-Intermediate Risk",
+                    "高危": "High Risk", "高风险": "High Risk",
+                    "不确定风险": "Uncertain Risk"
+                }
+                en_risk_keyword = risk_mapping.get(extracted_risk_keyword, "")
+                
+                print(f"  -> ESGO 前置推演完成 (尝试 {attempt+1}/{max_retries})，判定结果: {extracted_risk_keyword} ({en_risk_keyword})")
+                
+                safe_clinical_conclusion = f"综合患者的分子分型、组织学分级、浸润深度及手术分期等病理特征，依据《2025 ESGO-ESTRO-ESP 子宫内膜癌管理指南》风险分层标准评估，该患者的复发风险等级判定为：【{extracted_risk_keyword} ({en_risk_keyword})】。"
+                return safe_clinical_conclusion, extracted_risk_keyword, en_risk_keyword
+            else:
+                print(f"  -> [Warning] 尝试 {attempt+1}/{max_retries}: 未检测到规范结果标签，重试...")
+                user_prompt += "\n\n【🚨 系统强制警告】：请重新推演，并确保最后一行严格输出例如 `<result>高危</result>` 的格式。"
+
+        except Exception as e:
+            print(f"  -> [Warning] 尝试 {attempt+1}/{max_retries} API 调用异常: {e}")
+            
+    print("  -> ❌ ESGO 前置推演重试达到上限，启用安全兜底隔离方案。")
+    safe_clinical_conclusion = "综合患者的病理特征，根据《2025 ESGO-ESTRO-ESP指南》评估，需进一步明确其复发风险等级（系统自动推演未匹配明确分级，请结合原版指南人工复核）。"
+    return safe_clinical_conclusion, "", ""
 
 # ================= Qwen-Reranker 打分逻辑 =================
 async def compute_rerank_score(query, doc, client):
@@ -218,7 +303,8 @@ except Exception as e:
 async def vector_stream_reranker(query_str, docs_list):
     if not docs_list: return []
     scores = await asyncio.gather(*[compute_rerank_score(query_str, doc, rerank_client) for doc in docs_list])
-    filtered_docs = [doc for doc, score in sorted(zip(docs_list, scores), key=lambda x: x[1], reverse=True) if score > 0.05]
+    # 为了保证能召回足够的临床试验数据，放宽阈值至 0.01
+    filtered_docs = [doc for doc, score in sorted(zip(docs_list, scores), key=lambda x: x[1], reverse=True) if score > 0.01]
     return filtered_docs
 
 async def main():
@@ -246,7 +332,7 @@ async def main():
 
     llm_client = AsyncOpenAI(base_url=VLLM_API_URL, api_key=VLLM_API_KEY)
 
-    # 此处为测试患者病历数据
+    # 测试患者病历数据
     patient_case = (
         """## 现病史：
 患者绝经10年， 近2年每月点滴样出血，小便后擦拭可见。每年未曾体检。2020-04-16因“绝经后阴道出血”当地医院就诊，B超检查， （未见报告）。遵医嘱行宫腔镜。4-29当地医院行宫腔镜。术后病理提示：（宫腔）宫内膜显示非典型增生伴输卵管上皮化生及靴钉样改变，灶区可疑癌变。建议手术。患者为进一步治疗，我院门诊就诊，病理会诊：NH2020-01874（宫腔）子宫内膜样癌，I级，周围内膜复杂不典型增生。5-8我院妇科常规彩色超声（经阴道）检查描述:【经阴道】 子宫位置：前位；子宫大小：长径 58mm，左右径 58mm，前后径 53mm； 子宫形态：不规则；子宫回声：不均匀； 肌层彩色血流星点状， 宫腔内中低回声区24*26*19mm   宫内IUD: 无。  宫颈长度:27mm子宫前壁突起中低回声区：27*24*22mm，右后壁向外突中低回声区：42*37*33mm，左侧壁下段肌层中高回声区：33*28*28mm，余肌层数枚低回声结节，最大直径18mm右卵巢：未暴露； 左卵巢：未暴露； 【盆腔积液】：无。诊断结论:宫腔内实质占位，符合病史。子宫多发肌瘤可能。门诊建议手术治疗，拟"子宫内膜癌"收住入院。
@@ -258,51 +344,37 @@ async def main():
 ## 家族史：
 否认家族性肿瘤、遗传性病史
 
-## 术前辅助检查：
-1.       B超：妇科常规彩色超声（经阴道）检查描述:【经阴道】 子宫位置：前位；子宫大小：长径 58mm，左右径 58mm，前后径 53mm； 子宫形态：不规则；子宫回声：不均匀； 肌层彩色血流星点状， 宫腔内中低回声区24*26*19mm   宫内IUD: 无。  宫颈长度:27mm子宫前壁突起中低回声区：27*24*22mm，右后壁向外突中低回声区：42*37*33mm，左侧壁下段肌层中高回声区：33*28*28mm，余肌层数枚低回声结节，最大直径18mm右卵巢：未暴露； 左卵巢：未暴露； 【盆腔积液】：无。诊断结论:宫腔内实质占位，符合病史。子宫多发肌瘤可能。
-2.      上腹部CT：1.肝脏右后叶近膈顶斑片状高密度影，介入术后改变？请结合临床病史。2.双肾小结石可能；双肾囊肿可能。
-3.      盆腔MRI：子宫形态尚可，呈前倾前屈位，宫体大小约6.7cm×5.8cm×4.3cm。子宫肌壁间及浆膜下可见多发结节影，最大位于子宫后壁浆膜下，大小约4.1cm*4.2cm*3.5cm，边界清晰，病灶向宫体外突出，病灶呈T1WI等低信号，T2WI低等信号，增强后轻度均匀强化，强化程度同肌层相仿。宫腔内可见一异常信号肿物影，大小约4.4cm×3.4cm×3.2cm，呈T1W等信号T2W稍高信号，DWI呈高信号，内膜肌层交界区不清，局部可达深肌层，最深处距离浆膜面约1mm。增强后肿物可见明显强化。双侧附件区未见异常信号影及异常强化灶。膀胱充盈尚可，膀胱壁完整，未见增厚，阴道、直肠未见明显异常信号。前、后陷凹内未见明显异常信号灶。增强后亦未见异常强化灶。所扫范围盆腔内及双侧腹股沟区未见明显肿大淋巴结影。影像结论：宫腔内肿物，考虑为子宫内膜癌，累及深肌层，局部可达浆膜面； 子宫多发肌瘤。
-4.      NH2020-01874（宫腔）子宫内膜样癌，I级，周围内膜复杂不典型增生。
-5.      CA125抗原：125.80U/ml  人附睾蛋白4：270.6pmol/L肿瘤相关： CA199抗原：568.30U/ml
-
-## 手术：
-1.腹腔镜下全子宫切除术(子宫＜10孕周)；2、腹腔镜下双侧输卵管卵巢切除
-3、腹腔镜下双侧前哨淋巴结清扫术（临床试验）
-
-子宫前位，大小4*3*3cm，形态不规则，子宫前壁见直径3cm质硬突起，右后壁向外突直径4cm质硬结节，左侧壁下段外突直径3cm质硬结节。左输卵管外观未见异常，左卵巢大小2.5*2*1.5cm，外观未见异常。右输卵管外观未见异常，右卵巢大小2*1.5*1cm，外观未见异常。其他：肠管、肝、脾、横隔下及盆壁未见明显异常。
-
 ## 术后病理：
 一、全子宫
 1.子宫内膜样癌，Ⅱ级，病灶大小4×3.5×2.5cm，浸润子宫深肌层；脉管内见癌栓；癌灶未累及宫颈。周围子宫内膜呈单纯萎缩性改变。
 2.子宫肌壁间多发平滑肌瘤。
 3.子宫局限型腺肌病。
 4.慢性宫颈炎。
-二、左侧卵巢包涵囊肿伴周围炎。
-    右侧卵巢包涵囊肿。
-三、左侧输卵管慢性炎。
-    右侧输卵管周围炎。
 四、（右侧前哨（超分期））淋巴结1/4枚见癌转移。
     （左侧前哨（超分期））淋巴结1/3枚见癌转移。
 免疫组化：MLH1（+），MSH2（+），MSH6（+），PMS2（+），ER（+，80%，强），PR（+，30%，强），P53（野生表型），Ki-67（+，30%），PTEN（+），AE1/AE3/CD31（脉管内见癌栓），AE1/AE3/D240（脉管内见癌栓）。
-（右侧前哨（超分期））AE1/AE3（见单个肿瘤细胞转移）。
-（左侧前哨（超分期））AE1/AE3（见单个肿瘤细胞转移）。
-（腹腔冲洗液液基细胞学）未找到恶性细胞。
 
 ## 术后诊断：
 子宫内膜样癌G2 III C1期（FIGO 2009）/T1bN1（sn）M0期"""
     )
+    
     print(f"\n>>> [3/5] 输入原始病例:\n")
     print("\n>>> [3.5/5] 正在调用 PathoLLM 提取全息患者画像与双语特征...")
+    patient_profile_md, bilingual_keywords = await extract_patient_profile(patient_case, llm_client)
+
+    print("\n>>> [3.6/5] 正在执行 ESGO 2025 零样本风险定级 (支持自纠错机制)...")
+    safe_clinical_conclusion, esgo_risk_level, en_risk_keyword = await evaluate_esgo_risk(patient_profile_md, llm_client)
     
-    # 提取画像和检索词
-    patient_profile_md, enhanced_query = await extract_patient_profile(patient_case, llm_client)
+    # 🚀 强行扩大召回网，将试验名字植入检索词，确保底层不漏掉数据
+    risk_query_addition = f"\n[ESGO推断组别]: {esgo_risk_level} ({en_risk_keyword} group)" if esgo_risk_level else ""
+    enhanced_query = f"NCCN ESGO 指南、术后辅助治疗方案与预后生存率、PORTEC临床试验生存数据 (Adjuvant treatment guidelines, prognosis overall survival, clinical trials, recommendations)\n{bilingual_keywords}{risk_query_addition}"
     
     print("\n>>> [4/5] 正在执行图谱混合检索与 MoE 动态融合...")
     extended_knowledge_pool = {} 
-    llm_context_list = []
 
     try:
-        param = QueryParam(mode="hybrid", top_k=40, max_token_for_text_unit=4000)
+        # 将召回数量拉高到60，给Reranker更多选择
+        param = QueryParam(mode="hybrid", top_k=60, max_token_for_text_unit=4000)
         retrieved_results = await graph_engine.aquery(enhanced_query, param)
         
         if isinstance(retrieved_results, list):
@@ -310,30 +382,15 @@ async def main():
                 if isinstance(item, dict):
                     content = item.get('<knowledge>', str(item)).strip()
                     graph_score = float(item.get('<coherence>', 0.0))
-                    
                     if content in ["RELATES_TO", "BELONG_TO", "EVIDENCE", ""] or len(content) < 5: 
                         continue
                         
                     if content.startswith("【权威循证溯源："):
-                        if "⚠️ 临床绝对警报" in content:
-                            tag_info = "🚨 禁忌症熔断警报"
-                        else:
-                            tag_info = "🧠 图谱高阶逻辑"
+                        tag_info = "🚨 禁忌症熔断警报" if "⚠️ 临床绝对警报" in content else "🧠 图谱高阶逻辑"
                         extended_knowledge_pool[content] = {"type": tag_info, "graph_score": graph_score}
                     else:
                         extended_knowledge_pool[content] = {"type": "🧩 纯向量语义召回", "graph_score": graph_score}
 
-            # ==========================================
-            # 🚀 核心阶段：MoE 门控网络自适应打分
-            # ==========================================
-            fragments_to_sort = []
-            anchor_emb_np = await embedding_func(enhanced_query)
-            anchor_tensor = torch.tensor(anchor_emb_np[0], dtype=torch.float32).unsqueeze(0).to(DEVICE)
-            
-            with torch.no_grad():
-                g_weight = moe_model(anchor_tensor).item()
-            print(f"\n🧠 [MoE 门控介入] 当前患者病情复杂度测算完毕，动态图谱信任权重: g = {g_weight:.3f}")
-            
             candidate_contents = list(extended_knowledge_pool.keys())
             
             if candidate_contents:
@@ -342,35 +399,39 @@ async def main():
                     for content in candidate_contents
                 ])
                 
+                fragments_to_sort = []
                 for idx, content in enumerate(candidate_contents):
                     info = extended_knowledge_pool[content]
                     sources = await get_source_details(graph_engine, content)
                     best_tier = min([get_guideline_tier(src.get('guidelines', '')) for src in sources] + [4])
-                    
                     semantic_score = semantic_scores[idx]
-                    graph_score = info["graph_score"]
                     
-                    final_score = (g_weight * graph_score) + ((1.0 - g_weight) * semantic_score)
-                    if "🚨" in info["type"]:
-                        final_score += 1000.0  
-                        
-                    tier_bonus = (4 - best_tier) * 0.1 
-                    final_score += tier_bonus
+                    final_score = (0.4 * info["graph_score"]) + (0.6 * semantic_score)
+                    if "🚨" in info["type"]: final_score += 1000.0  
+                    final_score += (4 - best_tier) * 0.1 
                     
                     fragments_to_sort.append({
-                        "content": content, "info": info, "sources": sources,
-                        "best_tier": best_tier, "semantic_score": semantic_score, 
-                        "graph_score": graph_score, "final_score": final_score
+                        "content": content, "sources": sources, "final_score": final_score
                     })
             
             fragments_to_sort.sort(key=lambda x: x["final_score"], reverse=True)
-            TOP_N_FOR_LLM = 10
-            selected_fragments = fragments_to_sort[:TOP_N_FOR_LLM]
+            selected_fragments = fragments_to_sort[:10]
 
-            print("\n" + "="*20 + f" MoE 动态融合重排证据 (Top {len(selected_fragments)}) " + "="*20)
-            bibliography, ref_counter, llm_context_list = {}, 1, []
+            bibliography = {}
+            ref_counter = 1
+            llm_context_list = []
             
-            for idx, frag in enumerate(selected_fragments):
+            # 无条件注入 ESGO 基石文献
+            esgo_paper_id = "paper::40744042"
+            bibliography[esgo_paper_id] = {
+                "id": esgo_paper_id, "pmid": "40744042",
+                "title": "ESGO-ESTRO-ESP guidelines for the management of patients with endometrial carcinoma: update 2025",
+                "guidelines": "ESGO指南", "ref_index": ref_counter
+            }
+            llm_context_list.append(f"【来源文献: [{ref_counter}] | 证据级别: ESGO指南 (首选)】 {safe_clinical_conclusion}")
+            ref_counter += 1
+
+            for frag in selected_fragments:
                 source_indices = []
                 for src in frag["sources"]:
                     src_id = src['id']
@@ -379,20 +440,11 @@ async def main():
                         bibliography[src_id] = src
                         ref_counter += 1
                     source_indices.append(f"[{bibliography[src_id]['ref_index']}]")
-                
-                tier_name = TIER_NAMES[frag['best_tier']]
-                ref_tag = f"【来源文献: {', '.join(source_indices)} | 证据级别: {tier_name}】" if source_indices else "【来源文献: 未知 | 证据级别: 缺乏指南支撑】"
-                
-                print(f"[{idx+1}] [{frag['info']['type']}] 复合总分: {frag['final_score']:.3f} | 图谱分: {frag['graph_score']:.3f} | 语义分: {frag['semantic_score']:.3f}")
-                print(f"内容: {frag['content'][:100]}...") 
-                print("-" * 30)
+                ref_tag = f"【来源文献: {', '.join(source_indices)}】" if source_indices else ""
                 llm_context_list.append(f"{ref_tag} {frag['content']}")
         
         context_str = "\n\n".join(llm_context_list)
         
-        # ==========================================
-        # 🛡️ 安全防线：放宽拦截条件，兼容国内外主流指南
-        # ==========================================
         guideline_keywords = ["ESGO", "NCCN", "FIGO", "中华医学会", "CSCO", "中国肿瘤", "ESMO"]
         if not any(kw in context_str.upper() for kw in guideline_keywords):
             print("\n⚠️ [安全警报]：未命中任何国内外主流指南，触发系统防幻觉兜底策略！")
@@ -404,52 +456,70 @@ async def main():
         print(f"检索出错: {e}")
         return
 
+    # ================= 🚀 终极“分工协同版” MDT 生成 Prompt (指南极尽详尽，数据留给下游) =================
+    system_prompt = "你是一名严谨的妇科肿瘤 MDT 首席专家。你的任务是：基于知识图谱提供的证据，对【权威指南推荐】进行极其详尽的拆解和论述；同时，为下游的 EBM（循证医学）多智能体系统提出需要深度查证的具体临床数据问题。严禁凭空捏造具体的生存率或 HR 数值。"
     
-    system_prompt = (
-        "你是一个极其严谨的顶级肿瘤医院 MDT（多学科会诊）专家。你的任务是根据传入的【全息患者画像】和【参考证据】，撰写一份极其详尽、专业、总字数在 2000 字左右的临床 Tumor Board (TB) 会诊报告。\n\n"
-        "【🚨 核心执业红线与引用规范（绝对遵守）】：\n"
-        "1. **极其详尽**：这是真实的临床会诊记录，严禁一笔带过或压缩信息！每一项指南的解析、每一个临床试验的数据对比都必须单独成段，详细展开论述。\n"
-        "2. **🚨绝对杜绝张冠李戴（最严厉警告）🚨**：你必须严格核对传入证据中每段开头的 `【来源文献: [x] | 证据级别: XXX】` 标签！\n"
-        "   - 如果你在报告中写“根据 ESGO 指南...”，你打的标号 [x] 对应的证据必须真的是 ESGO！\n"
-        "   - 如果你写“根据 NCCN 指南...”，你打的标号 [x] 必须真的是 NCCN！\n"
-        "   - 绝对禁止把《中华医学会》或《中国肿瘤指南》硬冠上 NCCN/ESGO 的名号并瞎打标号！如果你在证据库里只看到了国内指南，请如实写“根据检索到的国内权威指南[x]推荐...”，绝不能强行伪造国际指南的出处！\n"
-        "3. **内置逻辑免引用**：本系统已内置【2025 ESGO 风险推演逻辑】，这属于系统固有知识。在进行 ESGO 风险判定时，请直接写“基于系统内置的 2025 ESGO 风险评估原则”，【绝对不要】为了凑格式而给它瞎编一个 [x] 标号！\n"
-        "4. **数据强制引用**：对于证据库中真实存在的临床试验数据（PFS/OS/HR等）、生存率、具体化疗方案，必须在句尾极其精准地打上对应的 [x]。\n\n"
-        "【📝 强制文书结构（请严格按以下四大模块输出，每个模块极尽详细）】：\n\n"
-        "病情分析：\n"
-        "1. **病历摘要**：用一段话（约200-300字）高度凝练患者核心病史（年龄、手术方式、病理类型、浸润深度、脉管癌栓、淋巴结转移、核心分子分型及最终 FIGO 分期）。\n"
-        "2. **ESGO 2025 风险分层与指南推荐**：\n"
-        "   - **风险判定**：根据系统内置逻辑树（POLE型IA-IIC低危,III-IVA不确定；MMRd型IA/IC低危,IB或IIC无LVSI/宫浸中危,IIA/IIB或IIC伴LVSI/宫浸中高危,III/IVA高危；NSMP低级ER+型IA低危,IB/IIA中危,IIB中高危,III/IVA高危；NSMP高级/ER-与p53abn型IA1/IC不确定,IA2-IVA高危）。写出推断依据，并加粗输出该患者的最终风险等级。\n"
-        "   - **ESGO 推荐主路径**：基于该风险等级，用代码块高亮显示 ESGO 指南的规范化推荐格式（必须严格形如：`Systemic Therapy ± EBRT ± vaginal brachytherapy` 或 `放化疗联合 / 单纯化疗` 等）。\n"
-        "   - **详细解析**：结合参考证据，详细展开论述 ESGO 对该风险人群的具体干预指导意见（如引用了外部证据，准确打标号 [x]）。\n"
-        "3. **NCCN 及其他权威指南推荐**：\n"
-        "   - 仔细查阅【参考证据】，如实反映检索到的指南（NCCN或国内指南等）。\n"
-        "   - **指南主路径**：用代码块高亮显示该指南的推荐公式（例如：`系统治疗 (Systemic therapy) ± 盆腔外照射 (EBRT)`）。\n"
-        "   - **详细解析**：展开论述该指南针对此分期及高危因素的具体化放疗细节（精准打标号 [x]）。\n"
-        "4. **核心临床试验深度解析**：【极其重要，必须长篇详写！】提取证据中与【本患者分子分型/分期】高度匹配的核心临床研究（如 PORTEC、ENGOT、GOG 等）。必须详细列出：研究背景与纳入人群、对照组与实验组的具体干预方案对比、**具体的 PFS/OS/HR 等统计学数值**，并深入剖析该试验结果应用到本患者身上的预期获益（精准打标号 [x]）。\n\n"
-        "术后处理：\n"
-        "1. **肿瘤专科主方案**：综合上述指南，下达果断的最终临床医嘱指令。明确写出具体的化疗药物组合（如紫杉醇+卡铂）、给药周期数、是否联合免疫/靶向药物，以及放疗的具体介入时机。\n"
-        "2. **合并症与多学科管理（逐条详细列出）**：全面扫描患者画像中的【全部合并症】（高血压/糖尿病/脑梗/冠心病/胃病等）。详细写明抗肿瘤药物对该合并症的具体毒性警示（如紫杉醇加重糖尿病末梢神经病变、抗血管生成药物增加脑梗血栓复发风险等），并下达对应专科（内分泌科/心内科/神经内科等）的详细随诊指令。\n\n"
-        "预后分析：\n"
-        "提取检索证据中针对此 FIGO 分期的客观数据库生存率数据（如 NCDB 的 3年/5年 OS 率）。结合本例患者的高危因素（深肌层浸润、淋巴结阳性、LVSI等）展开一段不少于150字的个体化预后讨论（精准打标号 [x]）。若证据中无确切数据，请明确注明“当前证据库未包含针对该分期确切的大样本生存数据”。\n\n"
-        "随访方案：\n"
-        "1. **随访时间表**：明确前2年、3-5年、5年后的具体随访频率。\n"
-        "2. **警示症状**：列举需立即就诊的异常体征（如盆腹腔疼痛、异常出血、血栓症状等）。\n"
-        "3. **检查项目明细**：详述妇检、肿瘤标志物、盆腹腔增强MRI/CT的实施频次。\n"
-        "4. **康复与心理支持**：涉及饮食指导、并发症管理、性健康及对复发恐惧的心理干预。"
-    )
-    
-    user_prompt = f"以下是患者的【全息特征画像】：\n{patient_profile_md}\n\n以下是图谱召回的【参考证据】：\n{context_str}\n\n请你深呼吸，仔细核对每一条参考证据的【来源文献】标签。严格按照上述要求，撰写一份内容极其丰富、数据详实、具备顶级主治医师水准的 Tumor Board 会诊报告。🚨最后警告：宁可不标文献序号，也绝对不准把国内指南硬冠上国际指南的名字瞎标序号！"
+    user_prompt = f"""以下是患者的【全息特征画像】：
+{patient_profile_md}
+
+以下是图谱召回的【参考证据】（已包含系统前置推演结论及权威文献）：
+{context_str}
+
+【🚨 核心分工与防幻觉准则】：
+1. **指南解析必须极尽详尽（核心任务！）**：下游的 EBM 系统无法阅读长篇的指南全文本。因此，你必须把你能在【参考证据】中看到的关于 ESGO、NCCN、国内共识的具体治疗细则（如：满足什么条件推荐什么放疗、化疗用什么方案等），**长篇大论、毫无遗漏地写出来，并打上标号 [x]**。
+2. **数据验证留给下游**：对于具体的临床试验（如 PORTEC-3 的具体 5 年 OS 百分比、HR 值），如果图谱证据里有，你可以简述；如果没有，**绝对禁止编造**，直接把获取这些精准数据的任务写在第四部分的“待查证问题”中！
+3. **拒绝张冠李戴**：认清指南名称，没检索到纯正的 NCCN 原文，就写国内指南或 ESGO 结论，切勿伪造。
+
+【📝 强制报告结构（请严格按照以下模块输出）】：
+
+# 妇科肿瘤 MDT 初始会诊报告
+
+## 一、 病情摘要与风险判定
+- **病历摘要**：凝练患者年龄、绝经史、合并症、核心病理、淋巴结状态及 FIGO 分期。
+- **ESGO 2025 风险分层**：直接引用 [1] 号文献的结论（如：**高危 (High Risk)** [1]）。
+
+## 二、 核心指南与共识详尽解析
+（🚨 **本段是报告的灵魂，必须长篇详写！**）
+- **指南主干路径**：用代码块高亮（如 `系统治疗 ± EBRT ± VBT`）。
+- **ESGO 指南详细解析**：展开论述 [1] 号文献对于该风险组的具体干预意见。
+- **其他指南详尽解析**：详细罗列检索到的 NCCN 或国内共识的具体细则（如盆腔外照射的具体指征、淋巴结阳性时的具体推荐等），必须带上真实文献标号 [x]。
+
+## 三、 初步专科治疗框架
+- **肿瘤主方案建议**：给出放化疗的大体建议及影像学复查节点。
+- **多学科及合并症管理**：
+  （**🚨 必须使用阿拉伯数字分点列出所有的合并症！绝不能合并成一段！**）
+  1、患者高血压，建议心内科随诊。
+  2、患者糖尿病，建议内分泌科随诊，关注化疗期间血糖波动。
+  3、患者脑梗后遗症，建议神经内科随诊，注意血栓风险。
+  ……（逐条列出）
+
+## 四、 随访大纲
+列出常规的随访频率（如前两年每3个月一次）以及需要患者警惕的核心异常体征（如提示粘连梗阻或复发的症状）、检查项目等。
+
+## 五、 🎯 待 PathoEBM 深度合成的临床问题（交接任务）
+（作为主治医师，请针对本病例的特殊性，向你的下游“EBM循证医学AI助手”提出 2~3 个需要它通过检索 PubMed 等数据库去深度查证的 PICO 问题。
+**提问思路示例**：
+- 请检索 PORTEC-3 等大型 RCT 的最新长期随访数据，明确该分期/分子分型患者接受放化疗联合的具体 OS/DFS 获益百分比及 HR 值。
+- 患者有20年糖尿病和脑梗史，请查阅真实世界数据（RWS），评估高龄合并严重心脑血管基础病的内膜癌患者，采用 TC 方案化疗的心血管/神经毒性发生率，并提供剂量调整的前沿文献。
+- 检索关于 L1CAM 等新兴标志物在此类高危患者中对预后影响的最新前沿研究。）
+
+💡 请先在 <think> 标签内梳理：1. 确认风险等级；2. 疯狂提取证据里的指南细节；3. 盘点所有合并症；4. 构思要留给下游的硬核数据问题。思考完毕后，输出这份专业报告！"""
 
     try:
         response = await llm_client.chat.completions.create(
             model=LLM_MODEL_NAME,
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            stream=True, temperature=0.0, max_tokens=2048
+            messages=[
+                {"role": "system", "content": system_prompt}, 
+                {"role": "user", "content": user_prompt}
+            ],
+            stream=True, 
+            temperature=0.2,       
+            max_tokens=8192        # 恢复 8192，给模型充足的 Token 去长篇大论地拆解指南
         )
         print("\n>>> 模型回复:\n")
         async for chunk in response:
-            if content := chunk.choices[0].delta.content: print(content, end="", flush=True)
+            if content := chunk.choices[0].delta.content: 
+                print(content, end="", flush=True)
         
         print("\n\n" + "="*20 + " 参考文献 (References) " + "="*20)
         if bibliography:
@@ -457,10 +527,12 @@ async def main():
                 idx, pmid_val, paper_id = details['ref_index'], details.get('pmid', 'Unknown'), details['id']
                 print(f"[{idx}] PMID: {pmid_val}" if pmid_val != 'Unknown' else f"[{idx}] DocID: {paper_id[:8]}... (无标准PMID文献)")
                 print(f"    Title: {details['title']}\n    Guidelines: {details['guidelines']}\n" + "-" * 10)
-        else: print("（本次检索未关联到具体文献节点）")
+        else: 
+            print("（本次检索未关联到具体文献节点）")
         print("="*50)
 
-    except Exception as e: print(f"LLM 调用失败: {e}")
+    except Exception as e: 
+        print(f"LLM 调用失败: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
