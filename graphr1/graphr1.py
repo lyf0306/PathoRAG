@@ -66,22 +66,6 @@ TiDBKVStorage = lazy_external_import(".kg.tidb_impl", "TiDBKVStorage")
 TiDBVectorDBStorage = lazy_external_import(".kg.tidb_impl", "TiDBVectorDBStorage")
 
 
-def always_get_an_event_loop() -> asyncio.AbstractEventLoop:
-    """
-    Ensure that there is always an event loop available.
-    """
-    try:
-        current_loop = asyncio.get_event_loop()
-        if current_loop.is_closed():
-            raise RuntimeError("Event loop is closed.")
-        return current_loop
-    except RuntimeError:
-        logger.info("Creating a new event loop in main thread.")
-        new_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(new_loop)
-        return new_loop
-
-
 @dataclass
 class GraphR1:
     working_dir: str = field(
@@ -136,6 +120,9 @@ class GraphR1:
     llm_model_max_async: int = 16
     llm_model_kwargs: dict = field(default_factory=dict)
 
+    # Reranker (保留你最新添加的属性)
+    reranker_func: callable = None
+
     # storage
     vector_db_storage_cls_kwargs: dict = field(default_factory=dict)
 
@@ -144,6 +131,10 @@ class GraphR1:
     # extension
     addon_params: dict = field(default_factory=dict)
     convert_response_to_json_func: callable = convert_response_to_json
+
+    # --- [工程鲁棒性新增] 系统级超时配置 ---
+    db_timeout: float = 5.0
+    llm_timeout: float = 45.0
 
     def __post_init__(self):
         log_file = os.path.join("graphr1.log")
@@ -247,11 +238,27 @@ class GraphR1:
             # "ArangoDBStorage": ArangoDBStorage
         }
 
-    def insert(self, string_or_strings):
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.ainsert(string_or_strings))
+    # ----------------------------------------------------------------------
+    # [重构] 彻底剥离危险的强制全局事件循环 (防止 FastAPI/Uvicorn 死锁)
+    # ----------------------------------------------------------------------
+    def _run_sync(self, coro):
+        """同步执行隔离包装器"""
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
 
-    # 修改： 增加了一个paper_name参数，用于标识文档来源
+        if current_loop and current_loop.is_running():
+            raise RuntimeError(
+                "检测到处于异步框架中。请直接调用异步方法 (例如: await aquery())，"
+                "切勿使用同步方法 (例如: query())，否则会导致线程阻塞或死锁。"
+            )
+        else:
+            return asyncio.run(coro)
+
+    def insert(self, string_or_strings, paper_name: str = None):
+        return self._run_sync(self.ainsert(string_or_strings, paper_name))
+
     async def ainsert(self, string_or_strings, paper_name: str = None):
         update_storage = False
         try:
@@ -332,11 +339,15 @@ class GraphR1:
             if storage_inst is None:
                 continue
             tasks.append(cast(StorageNameSpace, storage_inst).index_done_callback())
-        await asyncio.gather(*tasks)
+        
+        # [修改] return_exceptions=True 防异常穿透雪崩
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for idx, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Task {idx} failed in _insert_done with error: {result}")
 
     def insert_custom_kg(self, custom_kg: dict):
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.ainsert_custom_kg(custom_kg))
+        return self._run_sync(self.ainsert_custom_kg(custom_kg))
 
     async def ainsert_custom_kg(self, custom_kg: dict):
         update_storage = False
@@ -365,7 +376,6 @@ class GraphR1:
                 entity_name = f'"{entity_data["entity_name"].upper()}"'
                 entity_type = entity_data.get("entity_type", "UNKNOWN")
                 description = entity_data.get("description", "No description provided")
-                # source_id = entity_data["source_id"]
                 source_chunk_id = entity_data.get("source_id", "UNKNOWN")
                 source_id = chunk_to_source_map.get(source_chunk_id, "UNKNOWN")
 
@@ -397,7 +407,6 @@ class GraphR1:
                 description = relationship_data["description"]
                 keywords = relationship_data["keywords"]
                 weight = relationship_data.get("weight", 1.0)
-                # source_id = relationship_data["source_id"]
                 source_chunk_id = relationship_data.get("source_id", "UNKNOWN")
                 source_id = chunk_to_source_map.get(source_chunk_id, "UNKNOWN")
 
@@ -471,20 +480,24 @@ class GraphR1:
                 await self._insert_done()
 
     def query(self, query: str, param: QueryParam = QueryParam(), entity_match=None, hyperedge_match=None):
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.aquery(query, param, entity_match, hyperedge_match))
+        return self._run_sync(self.aquery(query, param, entity_match, hyperedge_match))
 
     async def aquery(self, query: str, param: QueryParam = QueryParam(), entity_match=None, hyperedge_match=None):
         # ----------------------------------------------------------------------
-        # [增强] 自动检索逻辑
-        # 如果未传入实体/超边匹配列表，自动调用向量库进行检索
+        # [增强] 自动检索逻辑 + [修改] 增加针对外部资源的硬性超时熔断
         # ----------------------------------------------------------------------
         if entity_match is None or hyperedge_match is None:
-            # 只有当 vector storage 可用且具备 query 方法时才执行
             if self.entities_vdb and hasattr(self.entities_vdb, "query"):
                 logger.info(f"Auto-retrieving entities for query: {query}")
                 try:
-                    entity_match = await self.entities_vdb.query(query, top_k=param.top_k)
+                    # 使用 wait_for 防止向量库查询挂起引发协程雪崩
+                    entity_match = await asyncio.wait_for(
+                        self.entities_vdb.query(query, top_k=param.top_k),
+                        timeout=self.db_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"[Timeout] Entity retrieval timed out for query: {query}")
+                    entity_match = []
                 except Exception as e:
                     logger.warning(f"Entity retrieval failed: {e}")
                     entity_match = []
@@ -494,7 +507,13 @@ class GraphR1:
             if self.hyperedges_vdb and hasattr(self.hyperedges_vdb, "query"):
                 logger.info(f"Auto-retrieving hyperedges for query: {query}")
                 try:
-                    hyperedge_match = await self.hyperedges_vdb.query(query, top_k=param.top_k)
+                    hyperedge_match = await asyncio.wait_for(
+                        self.hyperedges_vdb.query(query, top_k=param.top_k),
+                        timeout=self.db_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"[Timeout] Hyperedge retrieval timed out for query: {query}")
+                    hyperedge_match = []
                 except Exception as e:
                     logger.warning(f"Hyperedge retrieval failed: {e}")
                     hyperedge_match = []
@@ -503,16 +522,30 @@ class GraphR1:
         # ----------------------------------------------------------------------
 
         if param.mode in ["hybrid"]:
-            response = await kg_query(
-                query,
-                self.chunk_entity_relation_graph,
-                entity_match,
-                hyperedge_match,
-                self.text_chunks,
-                param,
-                asdict(self),
-                hashing_kv=self.llm_response_cache,
-            )
+            try:
+                # 给知识图谱大模型推理节点加上全局超时保障
+                response = await asyncio.wait_for(
+                    kg_query(
+                        query,
+                        self.chunk_entity_relation_graph,
+                        entity_match,
+                        hyperedge_match,
+                        self.text_chunks,
+                        param,
+                        asdict(self),
+                        hashing_kv=self.llm_response_cache,
+                    ),
+                    timeout=self.llm_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"[Timeout] LLM Hybrid Query timed out for: {query}")
+                response = "System Error: Knowledge Graph query timed out."
+            except Exception as e:
+                logger.error(f"[Error] LLM Hybrid Query failed: {e}")
+                response = "System Error: Failed to generate response from Knowledge Graph."
+        else:
+            response = "Only hybrid mode is supported currently."
+            
         await self._query_done()
         return response
 
@@ -522,11 +555,15 @@ class GraphR1:
             if storage_inst is None:
                 continue
             tasks.append(cast(StorageNameSpace, storage_inst).index_done_callback())
-        await asyncio.gather(*tasks)
+            
+        # [修改] return_exceptions=True 防异常穿透雪崩
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for idx, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Task {idx} failed in _query_done with error: {result}")
 
     def delete_by_entity(self, entity_name: str):
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.adelete_by_entity(entity_name))
+        return self._run_sync(self.adelete_by_entity(entity_name))
 
     async def adelete_by_entity(self, entity_name: str):
         entity_name = f'"{entity_name.upper()}"'
@@ -553,4 +590,9 @@ class GraphR1:
             if storage_inst is None:
                 continue
             tasks.append(cast(StorageNameSpace, storage_inst).index_done_callback())
-        await asyncio.gather(*tasks)
+            
+        # [修改] return_exceptions=True 防异常穿透雪崩
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for idx, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Task {idx} failed in _delete_by_entity_done with error: {result}")
